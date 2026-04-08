@@ -27,3 +27,11 @@ source .venv/bin/activate
 ```bash
 pip freeze > requirements.txt
 ```
+
+## News analysis
+
+For news you will need an API Key from <a href="https://newsapi.org/" target="_blank">newsapi.org</a>
+
+## Enviroment
+
+copy `.env.sample` to `.env` and fill your `newsapi.org` API Key.
