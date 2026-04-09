@@ -70,6 +70,18 @@ class WindowsForexMasterAI:
         sl = price - 200 * point if order_type == mt5.ORDER_TYPE_BUY else price + 200 * point
         tp = price + 400 * point if order_type == mt5.ORDER_TYPE_BUY else price - 400 * point
 
+        def get_filling_mode(symbol):
+            """Αυτοματοποιημένος εντοπισμός του σωστού Filling Mode"""
+            symbol_info = mt5.symbol_info(symbol)
+            filling_mode = symbol_info.filling_mode
+            
+            if filling_mode & mt5.SYMBOL_FILLING_FOK:
+                return mt5.ORDER_FILLING_FOK
+            elif filling_mode & mt5.SYMBOL_FILLING_IOC:
+                return mt5.ORDER_FILLING_IOC
+            else:
+                return mt5.ORDER_FILLING_RETURN
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": SYMBOL,
@@ -82,7 +94,7 @@ class WindowsForexMasterAI:
             "magic": self.magic_number,
             "comment": "AI News Sentiment Trade",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": get_filling_mode(SYMBOL),
         }
 
         # Αποστολή εντολής
