@@ -21,7 +21,7 @@ SYMBOLS_CONFIG = {
 LOTS = 0.1
 THRESHOLD = 0.1
 INTERVAL = 5*60 
-CORR_LIMIT = 0.75 # Όριο συσχέτισης για μπλοκάρισμα trades
+CORR_LIMIT = 0.75
 
 class MultiAssetForexAI:
     def __init__(self):
@@ -33,7 +33,7 @@ class MultiAssetForexAI:
         self.magic_number = 20260408
         self.symbols = list(SYMBOLS_CONFIG.keys())
         
-        print(f"--- [SYSTEM] Multi-Asset AI Engine Active ---")
+        print(f"--- [SYSTEM] Hybrid AI Engine Active (Sentiment + Technicals) ---")
         print(f"--- [INFO] Monitoring: {', '.join(self.symbols)} ---\n")
 
     def is_market_open(self):
@@ -53,8 +53,25 @@ class MultiAssetForexAI:
             print(f"❌ News API Error: {e}")
             return []
 
+    def get_market_structure(self, symbol):
+        """Υπολογισμός Τάσης (EMA 200) και Support/Resistance (100H High/Low)"""
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, 200)
+        if rates is None: return "NEUTRAL", 0, 0
+        
+        df = pd.DataFrame(rates)
+        # EMA 200
+        ema200 = df['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+        current_price = df['close'].iloc[-1]
+        trend = "BULL" if current_price > ema200 else "BEAR"
+        
+        # S/R στα τελευταία 100 κεριά
+        recent = df.tail(100)
+        res = recent['high'].max()
+        sup = recent['low'].min()
+        
+        return trend, sup, res
+
     def get_filling_mode(self, symbol):
-        """Διορθωμένο: Χρήση αριθμητικών flags για αποφυγή AttributeError"""
         symbol_info = mt5.symbol_info(symbol)
         if symbol_info is None: return mt5.ORDER_FILLING_FOK
         filling = symbol_info.filling_mode
@@ -63,7 +80,6 @@ class MultiAssetForexAI:
         return mt5.ORDER_FILLING_RETURN
 
     def get_correlation(self, s1, s2, lookback=50):
-        """Υπολογισμός συσχέτισης μεταξύ δύο assets"""
         r1 = mt5.copy_rates_from_pos(s1, mt5.TIMEFRAME_H1, 0, lookback)
         r2 = mt5.copy_rates_from_pos(s2, mt5.TIMEFRAME_H1, 0, lookback)
         if r1 is None or r2 is None: return 0
@@ -71,7 +87,6 @@ class MultiAssetForexAI:
         return df.corr().iloc[0, 1]
 
     def is_too_correlated(self, new_symbol):
-        """Risk Guardrail: Έλεγχος συσχέτισης με ανοιχτές θέσεις"""
         active_positions = mt5.positions_get()
         if not active_positions: return False
         for pos in active_positions:
@@ -86,50 +101,45 @@ class MultiAssetForexAI:
         si = mt5.symbol_info(symbol)
         tick = mt5.symbol_info_tick(symbol)
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        
         sl = price - 200 * si.point if order_type == mt5.ORDER_TYPE_BUY else price + 200 * si.point
         tp = price + 400 * si.point if order_type == mt5.ORDER_TYPE_BUY else price - 400 * si.point
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": LOTS,
             "type": order_type, "price": price, "sl": sl, "tp": tp,
-            "deviation": 10, "magic": self.magic_number, "comment": "AI Multi-Asset",
+            "deviation": 10, "magic": self.magic_number, "comment": "AI Hybrid Strategy",
             "type_time": mt5.ORDER_TIME_GTC, "type_filling": self.get_filling_mode(symbol),
         }
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S") # Το τρέχον timestamp
-        
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         result = mt5.order_send(request)
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             print(f"[{now}] ❌ {symbol} Trade Failed: {result.comment}")
         else:
-            # Εδώ προσθέσαμε την τιμή και την ώρα
             print(f"[{now}] 🚀 SUCCESS: {symbol} {'BUY' if order_type==0 else 'SELL'} at {price}")
 
-    def save_to_csv(self, symbol, avg_score, action, headline):
+    def save_to_csv(self, symbol, avg_score, action, headline, trend, sup, res):
         file_name = "forex_ai_trading_logs.csv"
         tick = mt5.symbol_info_tick(symbol)
         price = tick.bid if tick else 0
         new_data = pd.DataFrame([{
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol, "price": price, "sentiment": round(avg_score, 4),
-            "action": action, "headline": headline.replace(',', '|') if headline else "N/A"
+            "action": action, "trend": trend, "support": sup, "resistance": res,
+            "headline": headline.replace(',', '|') if headline else "N/A"
         }])
         new_data.to_csv(file_name, index=False, mode='a', header=not os.path.exists(file_name), encoding='utf-8')
 
     def run_cycle(self):
-        """Εκτέλεση ενός πλήρους κύκλου με timestamps"""
         now_full = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
         if not self.is_market_open():
             print(f"[{now_full}] 💤 Market Closed. Hibernating...")
             return
 
         print(f"[{now_full}] 🟢 Scanning Market & News...")
         articles = self.fetch_global_news()
-        
-        if not articles:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ No global news fetched.")
-            return
+        if not articles: return
 
         for symbol in self.symbols:
             keywords = SYMBOLS_CONFIG[symbol]
@@ -138,12 +148,29 @@ class MultiAssetForexAI:
             if relevant:
                 avg_score = sum([self.analyzer.polarity_scores(h)['compound'] for h in relevant]) / len(relevant)
                 
+                # Τεχνική Ανάλυση
+                trend, sup, res = self.get_market_structure(symbol)
+                tick = mt5.symbol_info_tick(symbol)
+                price = tick.bid if tick else 0
+                
+                # Hybrid Decision Logic
                 action = "WAIT"
                 if avg_score > THRESHOLD: action = "BUY"
                 elif avg_score < -THRESHOLD: action = "SELL"
 
                 final_status = action
-                if action != "WAIT":
+                
+                # Check for Technical Alignment (Trend Following)
+                if action == "BUY" and trend != "BULL": final_status = "TREND_MISMATCH_BUY"
+                elif action == "SELL" and trend != "BEAR": final_status = "TREND_MISMATCH_SELL"
+                
+                # Check for S/R proximity (15 pips buffer)
+                point = mt5.symbol_info(symbol).point
+                if action == "BUY" and (res - price) < 150 * point: final_status = "RESISTANCE_NEAR"
+                if action == "SELL" and (price - sup) < 150 * point: final_status = "SUPPORT_NEAR"
+
+                # Trade Execution αν όλα είναι οκ
+                if final_status in ["BUY", "SELL"]:
                     if len(mt5.positions_get(symbol=symbol)) > 0:
                         final_status = f"LOGGED_{action}_NO_TRADE"
                     elif self.is_too_correlated(symbol):
@@ -153,14 +180,12 @@ class MultiAssetForexAI:
                         self.execute_trade(symbol, ot)
 
                 now_time = datetime.now().strftime("%H:%M:%S")
-                self.save_to_csv(symbol, avg_score, final_status, relevant[0])
-                print(f"[{now_time}] 📊 {symbol} | Sentiment: {avg_score:.2f} | Status: {final_status}")
+                self.save_to_csv(symbol, avg_score, final_status, relevant[0], trend, sup, res)
+                print(f"[{now_time}] 📊 {symbol} | Sent: {avg_score:.2f} | Trend: {trend} | Status: {final_status}")
 
     def run_forever(self):
-        """Το κύριο loop με το τελικό timestamp αναμονής"""
         while True:
             self.run_cycle()
-            
             now_time = datetime.now().strftime("%H:%M:%S")
             print(f"[{now_time}] ⏳ Cycle complete. Waiting {INTERVAL/60} minutes...\n")
             time.sleep(INTERVAL)
