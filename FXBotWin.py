@@ -117,9 +117,19 @@ class MultiAssetForexAI:
         new_data.to_csv(file_name, index=False, mode='a', header=not os.path.exists(file_name), encoding='utf-8')
 
     def run_cycle(self):
-        if not self.is_market_open(): return
+        """Εκτέλεση ενός πλήρους κύκλου με timestamps"""
+        now_full = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if not self.is_market_open():
+            print(f"[{now_full}] 💤 Market Closed. Hibernating...")
+            return
+
+        print(f"[{now_full}] 🟢 Scanning Market & News...")
         articles = self.fetch_global_news()
-        if not articles: return
+        
+        if not articles:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ No global news fetched.")
+            return
 
         for symbol in self.symbols:
             keywords = SYMBOLS_CONFIG[symbol]
@@ -127,9 +137,7 @@ class MultiAssetForexAI:
 
             if relevant:
                 avg_score = sum([self.analyzer.polarity_scores(h)['compound'] for h in relevant]) / len(relevant)
-                now = datetime.now().strftime("%H:%M:%S") # Timestamp μόνο ώρας για τα logs
-
-                # Decision Logic
+                
                 action = "WAIT"
                 if avg_score > THRESHOLD: action = "BUY"
                 elif avg_score < -THRESHOLD: action = "SELL"
@@ -144,12 +152,17 @@ class MultiAssetForexAI:
                         ot = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
                         self.execute_trade(symbol, ot)
 
+                now_time = datetime.now().strftime("%H:%M:%S")
                 self.save_to_csv(symbol, avg_score, final_status, relevant[0])
-                print(f"[{now}] 📊 {symbol} | Sentiment: {avg_score:.2f} | Status: {final_status}")
+                print(f"[{now_time}] 📊 {symbol} | Sentiment: {avg_score:.2f} | Status: {final_status}")
 
     def run_forever(self):
+        """Το κύριο loop με το τελικό timestamp αναμονής"""
         while True:
             self.run_cycle()
+            
+            now_time = datetime.now().strftime("%H:%M:%S")
+            print(f"[{now_time}] ⏳ Cycle complete. Waiting {INTERVAL/60} minutes...\n")
             time.sleep(INTERVAL)
 
 if __name__ == "__main__":
