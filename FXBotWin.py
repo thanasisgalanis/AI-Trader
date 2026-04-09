@@ -4,6 +4,7 @@ import time
 import os
 import pandas as pd
 import numpy as np
+import json
 from datetime import datetime
 from dotenv import load_dotenv
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -23,6 +24,48 @@ THRESHOLD = 0.1
 INTERVAL = 5*60 
 CORR_LIMIT = 0.75
 
+class TradeLogger:
+    """Διαχείριση JSON Logs για πραγματικά (με tracking) και εικονικά trades"""
+    def __init__(self):
+        self.executed_file = "executed_trades.json"
+        self.rejected_file = "virtual_backtest.json"
+
+    def _append_json(self, file_name, data):
+        if not os.path.exists(file_name):
+            with open(file_name, 'w', encoding='utf-8') as f:
+                json.dump([data], f, indent=4, ensure_ascii=False)
+        else:
+            with open(file_name, 'r+', encoding='utf-8') as f:
+                try:
+                    file_data = json.load(f)
+                except json.JSONDecodeError:
+                    file_data = []
+                file_data.append(data)
+                f.seek(0)
+                f.truncate()
+                json.dump(file_data, f, indent=4, ensure_ascii=False)
+
+    def update_trade_result(self, ticket, profit, exit_price):
+        """Ενημερώνει μια εγγραφή στο JSON όταν η θέση κλείνει στην MT5"""
+        if not os.path.exists(self.executed_file): return
+
+        with open(self.executed_file, 'r+', encoding='utf-8') as f:
+            trades = json.load(f)
+            updated = False
+            for trade in trades:
+                if trade.get("ticket") == ticket and trade.get("status") == "OPEN":
+                    trade["status"] = "CLOSED"
+                    trade["exit_price"] = exit_price
+                    trade["profit"] = round(profit, 2)
+                    trade["closed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    updated = True
+                    break
+            
+            if updated:
+                f.seek(0)
+                f.truncate()
+                json.dump(trades, f, indent=4, ensure_ascii=False)
+
 class MultiAssetForexAI:
     def __init__(self):
         if not mt5.initialize():
@@ -30,12 +73,13 @@ class MultiAssetForexAI:
             quit()
         
         self.analyzer = SentimentIntensityAnalyzer()
+        self.logger = TradeLogger()
         self.magic_number = 20260408
         self.symbols = list(SYMBOLS_CONFIG.keys())
         
-        print(f"--- [SYSTEM] Hybrid AI Engine Active (Sentiment + Technicals) ---")
-        print(f"--- [INFO] Friday Auto-Close: ENABLED (22:30) ---")
-        print(f"--- [INFO] Monitoring: {', '.join(self.symbols)} ---\n")
+        print(f"--- [SYSTEM] Hybrid AI Engine Active ---")
+        print(f"--- [INFO] Dual JSON Logging & Ticket Tracking: ACTIVE ---")
+        print(f"--- [INFO] Friday Auto-Close: ENABLED (22:30) ---\n")
 
     def is_market_open(self):
         now = datetime.now()
@@ -55,7 +99,6 @@ class MultiAssetForexAI:
             return []
 
     def get_market_structure(self, symbol):
-        """Υπολογισμός Τάσης (EMA 200) και Support/Resistance (100H High/Low)"""
         rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, 200)
         if rates is None: return "NEUTRAL", 0, 0
         df = pd.DataFrame(rates)
@@ -68,10 +111,7 @@ class MultiAssetForexAI:
     def get_filling_mode(self, symbol):
         si = mt5.symbol_info(symbol)
         if si is None: return mt5.ORDER_FILLING_FOK
-        filling = si.filling_mode
-        if filling & 1: return mt5.ORDER_FILLING_FOK
-        elif filling & 2: return mt5.ORDER_FILLING_IOC
-        return mt5.ORDER_FILLING_RETURN
+        return mt5.ORDER_FILLING_FOK if si.filling_mode & 1 else mt5.ORDER_FILLING_IOC
 
     def get_correlation(self, s1, s2, lookback=50):
         r1 = mt5.copy_rates_from_pos(s1, mt5.TIMEFRAME_H1, 0, lookback)
@@ -82,15 +122,14 @@ class MultiAssetForexAI:
 
     def is_too_correlated(self, new_symbol):
         active_positions = mt5.positions_get()
-        if not active_positions: return False
+        if not active_positions: return False, None, 0
         for pos in active_positions:
             if pos.symbol == new_symbol: continue
             corr = self.get_correlation(new_symbol, pos.symbol)
             if abs(corr) > CORR_LIMIT:
-                print(f"⚠️ Correlation Block: {new_symbol} vs {pos.symbol} ({corr:.2f})")
-                return True
-        return False
-    
+                return True, pos.symbol, corr
+        return False, None, 0
+
     def is_volatility_sufficient(self, symbol, target_pips=400):
         rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, 14)
         if rates is None: return False
@@ -100,7 +139,7 @@ class MultiAssetForexAI:
                                          abs(df['low'] - df['close'].shift(1))))
         atr = df['tr'].mean()
         point = mt5.symbol_info(symbol).point
-        return atr > (target_pips * point * 0.25) # Τουλάχιστον 25% του TP σε 1H ATR
+        return atr > (target_pips * point * 0.25)
 
     def is_time_safe(self):
         now = datetime.now()
@@ -113,7 +152,7 @@ class MultiAssetForexAI:
         if now.weekday() == 4 and now.hour == 22 and now.minute >= 30:
             positions = mt5.positions_get()
             if positions:
-                print(f"[{now.strftime('%H:%M:%S')}] 🛡️ Friday Exit Triggered. Closing all...")
+                print(f"[{now.strftime('%H:%M:%S')}] 🛡️ Friday Exit Triggered.")
                 for pos in positions:
                     self.close_position(pos)
                 return True
@@ -121,17 +160,39 @@ class MultiAssetForexAI:
 
     def close_position(self, pos):
         tick = mt5.symbol_info_tick(pos.symbol)
-        type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
         request = {
             "action": mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": pos.volume,
-            "type": type, "position": pos.ticket, "price": price, "deviation": 10,
+            "type": order_type, "position": pos.ticket, "price": price, "deviation": 10,
             "magic": self.magic_number, "comment": "Friday Auto-Close",
             "type_time": mt5.ORDER_TIME_GTC, "type_filling": self.get_filling_mode(pos.symbol)
         }
         return mt5.order_send(request)
 
-    def execute_trade(self, symbol, order_type):
+    def update_closed_trades(self):
+        """Ελέγχει το ιστορικό της MT5 για να κλείσει τα trades στο JSON"""
+        if not os.path.exists(self.logger.executed_file): return
+        
+        with open(self.logger.executed_file, 'r') as f:
+            trades = json.load(f)
+        
+        open_tickets = [t['ticket'] for t in trades if t['status'] == "OPEN"]
+        if not open_tickets: return
+
+        # Ελέγχουμε το ιστορικό των τελευταίων 24 ωρών
+        from_date = datetime.now().timestamp() - 86400
+        history_orders = mt5.history_deals_get(from_date, datetime.now().timestamp())
+        
+        if history_orders:
+            for deal in history_orders:
+                if deal.position_id in open_tickets:
+                    # Αν βρούμε deal κλεισίματος (entry=1 σημαίνει out)
+                    if deal.entry == 1:
+                        self.logger.update_trade_result(deal.position_id, deal.profit, deal.price)
+                        print(f"✅ Ticket {deal.position_id} closed. Profit: {deal.profit} logged to JSON.")
+
+    def execute_trade(self, symbol, order_type, sentiment, trend):
         si = mt5.symbol_info(symbol)
         tick = mt5.symbol_info_tick(symbol)
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
@@ -146,8 +207,16 @@ class MultiAssetForexAI:
         }
         res = mt5.order_send(request)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         if res.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"[{now}] 🚀 SUCCESS: {symbol} Trade Executed")
+            trade_data = {
+                "ticket": res.order, # Μοναδικό Ticket ID
+                "timestamp": now, "symbol": symbol, "action": "BUY" if order_type == 0 else "SELL",
+                "status": "OPEN", "price": price, "sl": sl, "tp": tp, 
+                "sentiment": sentiment, "trend": trend
+            }
+            self.logger._append_json(self.logger.executed_file, trade_data)
+            print(f"[{now}] 🚀 SUCCESS: {symbol} Executed (Ticket: {res.order})")
         else:
             print(f"[{now}] ❌ {symbol} Failed: {res.comment}")
 
@@ -167,6 +236,9 @@ class MultiAssetForexAI:
         now_full = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if not self.is_market_open(): return
         if self.check_friday_exit(): return
+        
+        # Ενημέρωση αποτελεσμάτων για κλειστά trades
+        self.update_closed_trades()
 
         print(f"[{now_full}] 🟢 Scanning Market & News...")
         articles = self.fetch_global_news()
@@ -180,22 +252,36 @@ class MultiAssetForexAI:
                 trend, sup, res = self.get_market_structure(symbol)
                 tick = mt5.symbol_info_tick(symbol)
                 price = tick.bid if tick else 0
+                
                 action = "WAIT"
                 if avg_score > THRESHOLD: action = "BUY"
                 elif avg_score < -THRESHOLD: action = "SELL"
                 
                 final_status = action
                 if action != "WAIT":
-                    if action == "BUY" and trend != "BULL": final_status = "TREND_MISMATCH"
-                    elif action == "SELL" and trend != "BEAR": final_status = "TREND_MISMATCH"
-                    elif action == "BUY" and (res - price) < 150 * mt5.symbol_info(symbol).point: final_status = "RESISTANCE_NEAR"
-                    elif action == "SELL" and (price - sup) < 150 * mt5.symbol_info(symbol).point: final_status = "SUPPORT_NEAR"
-                    elif len(mt5.positions_get(symbol=symbol)) > 0: final_status = "POSITION_ACTIVE"
-                    elif self.is_too_correlated(symbol): final_status = "CORR_BLOCKED"
-                    elif not self.is_time_safe(): final_status = "FRIDAY_NIGHT_SKIP"
-                    elif not self.is_volatility_sufficient(symbol): final_status = "LOW_VOLATILITY"
+                    rejection_reason = None
+                    is_corr, corr_sym, corr_val = self.is_too_correlated(symbol)
+                    
+                    if action == "BUY" and trend != "BULL": rejection_reason = "TREND_MISMATCH"
+                    elif action == "SELL" and trend != "BEAR": rejection_reason = "TREND_MISMATCH"
+                    elif action == "BUY" and (res - price) < 150 * mt5.symbol_info(symbol).point: rejection_reason = "RESISTANCE_NEAR"
+                    elif action == "SELL" and (price - sup) < 150 * mt5.symbol_info(symbol).point: rejection_reason = "SUPPORT_NEAR"
+                    elif len(mt5.positions_get(symbol=symbol)) > 0: rejection_reason = "POSITION_ACTIVE"
+                    elif is_corr: rejection_reason = f"CORR_BLOCKED_{corr_sym}"
+                    elif not self.is_time_safe(): rejection_reason = "FRIDAY_NIGHT_SKIP"
+                    elif not self.is_volatility_sufficient(symbol): rejection_reason = "LOW_VOLATILITY"
+
+                    if rejection_reason:
+                        final_status = rejection_reason
+                        virtual_data = {
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "symbol": symbol, "intended": action, "price": price,
+                            "reason": rejection_reason, "sentiment": avg_score, "trend": trend
+                        }
+                        self.logger._append_json(self.logger.rejected_file, virtual_data)
                     else:
-                        self.execute_trade(symbol, mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL)
+                        ot = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+                        self.execute_trade(symbol, ot, avg_score, trend)
 
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {symbol} | Sent: {avg_score:.2f} | Status: {final_status}")
                 self.save_to_csv(symbol, avg_score, final_status, relevant[0], trend, sup, res)
@@ -208,7 +294,8 @@ class MultiAssetForexAI:
 
 if __name__ == "__main__":
     bot = MultiAssetForexAI()
-    try: bot.run_forever()
+    try:
+        bot.run_forever()
     except KeyboardInterrupt:
         mt5.shutdown()
-        print("\n--- [SYSTEM] Stopped ---")
+        print("\n--- [SYSTEM] Stopped by user ---")
