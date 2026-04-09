@@ -3,6 +3,7 @@ import requests
 import time
 import os
 import pandas as pd
+import numpy as np
 from datetime import datetime
 from dotenv import load_dotenv
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -10,192 +11,150 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 load_dotenv()
 
 # --- CONFIGURATION ---
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # Αντικατάστησε με το κλειδί από newsapi.org
-SYMBOL = "EURUSD"                # Το ζεύγος προς διαπραγμάτευση
-LOTS = 0.1                       # Μέγεθος θέσης (0.10 = 10,000 units)
-THRESHOLD = 0.1                  # Ευαισθησία Sentiment (-1 έως 1)
-INTERVAL = 5*60                   # Κύκλος ελέγχου (5 λεπτά)
+NEWS_API_KEY = os.getenv("NEWS_API_KEY") 
+SYMBOLS_CONFIG = {
+    "EURUSD": ["EUR", "ECB", "Eurozone", "Fed", "USD"],
+    "GBPUSD": ["GBP", "Pound", "BoE", "London", "USD"],
+    "XAUUSD": ["Gold", "XAU", "Inflation", "Safe Haven"],
+    "USDJPY": ["JPY", "Yen", "BoJ", "Tokyo", "USD"]
+}
+LOTS = 0.1
+THRESHOLD = 0.1
+INTERVAL = 5*60 
+CORR_LIMIT = 0.75 # Όριο συσχέτισης για μπλοκάρισμα trades
 
-class WindowsForexMasterAI:
+class MultiAssetForexAI:
     def __init__(self):
-        # 1. Σύνδεση με το MT5 API
         if not mt5.initialize():
-            print("❌ MT5 Initialization Failed. Βεβαιωθείτε ότι το MT5 είναι ανοιχτό.")
+            print("❌ MT5 Initialization Failed.")
             quit()
         
         self.analyzer = SentimentIntensityAnalyzer()
-        self.magic_number = 20260408 # Μοναδικό ID για τα trades του Bot
+        self.magic_number = 20260408
+        self.symbols = list(SYMBOLS_CONFIG.keys())
         
-        print(f"--- [SYSTEM] Native Windows AI Engine Active ---")
-        print(f"--- [INFO] Connected to {SYMBOL} | Interval: {INTERVAL/60}m ---\n")
+        print(f"--- [SYSTEM] Multi-Asset AI Engine Active ---")
+        print(f"--- [INFO] Monitoring: {', '.join(self.symbols)} ---\n")
 
     def is_market_open(self):
-        """Weekend Guardrail: Σταματάει την ανάλυση τα Σαββατοκύριακα"""
         now = datetime.now()
-        day = now.weekday() # 0=Mon, 5=Sat, 6=Sun
-        hour = now.hour
-        if day == 5 or (day == 4 and hour >= 23) or (day == 6 and hour < 23):
+        day = now.weekday() 
+        if day == 5 or (day == 4 and now.hour >= 23) or (day == 6 and now.hour < 23):
             return False
         return True
 
-    def fetch_live_news(self):
-        """Data Stage: Συλλογή ειδήσεων σε πραγματικό χρόνο"""
-        url = f'https://newsapi.org/v2/everything?q=EUR+USD+ECB+Fed&language=en&sortBy=publishedAt&apiKey={NEWS_API_KEY}'
+    def fetch_global_news(self):
+        query = "Forex OR Fed OR ECB OR Economy OR Inflation"
+        url = f'https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&apiKey={NEWS_API_KEY}'
         try:
             response = requests.get(url)
-            data = response.json()
-            articles = data.get('articles', [])
-            return [a['title'] for a in articles[:10]]
+            return response.json().get('articles', [])
         except Exception as e:
             print(f"❌ News API Error: {e}")
             return []
 
-    def check_existing_positions(self):
-        """Risk Guardrail: Αποφυγή over-trading"""
-        positions = mt5.positions_get(symbol=SYMBOL)
-        return len(positions) > 0
+    def get_filling_mode(self, symbol):
+        """Διορθωμένο: Χρήση αριθμητικών flags για αποφυγή AttributeError"""
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None: return mt5.ORDER_FILLING_FOK
+        filling = symbol_info.filling_mode
+        if filling & 1: return mt5.ORDER_FILLING_FOK
+        elif filling & 2: return mt5.ORDER_FILLING_IOC
+        return mt5.ORDER_FILLING_RETURN
 
-    def execute_trade(self, order_type):
-        """Execution Stage: Άμεση αποστολή εντολής στον Broker"""
-        symbol_info = mt5.symbol_info(SYMBOL)
-        if symbol_info is None:
-            print(f"❌ {SYMBOL} not found.")
-            return
+    def get_correlation(self, s1, s2, lookback=50):
+        """Υπολογισμός συσχέτισης μεταξύ δύο assets"""
+        r1 = mt5.copy_rates_from_pos(s1, mt5.TIMEFRAME_H1, 0, lookback)
+        r2 = mt5.copy_rates_from_pos(s2, mt5.TIMEFRAME_H1, 0, lookback)
+        if r1 is None or r2 is None: return 0
+        df = pd.DataFrame({"s1": [x['close'] for x in r1], "s2": [x['close'] for x in r2]})
+        return df.corr().iloc[0, 1]
 
-        # Υπολογισμός τιμών, SL και TP
-        tick = mt5.symbol_info_tick(SYMBOL)
+    def is_too_correlated(self, new_symbol):
+        """Risk Guardrail: Έλεγχος συσχέτισης με ανοιχτές θέσεις"""
+        active_positions = mt5.positions_get()
+        if not active_positions: return False
+        for pos in active_positions:
+            if pos.symbol == new_symbol: continue
+            corr = self.get_correlation(new_symbol, pos.symbol)
+            if abs(corr) > CORR_LIMIT:
+                print(f"⚠️ Correlation Block: {new_symbol} vs {pos.symbol} ({corr:.2f})")
+                return True
+        return False
+
+    def execute_trade(self, symbol, order_type):
+        si = mt5.symbol_info(symbol)
+        tick = mt5.symbol_info_tick(symbol)
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-        point = symbol_info.point
-        
-        # SL στα 20 pips, TP στα 40 pips
-        sl = price - 200 * point if order_type == mt5.ORDER_TYPE_BUY else price + 200 * point
-        tp = price + 400 * point if order_type == mt5.ORDER_TYPE_BUY else price - 400 * point
-
-        def get_filling_mode(symbol):
-            """Αυτοματοποιημένος εντοπισμός του σωστού Filling Mode"""
-            symbol_info = mt5.symbol_info(symbol)
-            filling_mode = symbol_info.filling_mode
-            
-            if filling_mode & mt5.SYMBOL_FILLING_FOK:
-                return mt5.ORDER_FILLING_FOK
-            elif filling_mode & mt5.SYMBOL_FILLING_IOC:
-                return mt5.ORDER_FILLING_IOC
-            else:
-                return mt5.ORDER_FILLING_RETURN
+        sl = price - 200 * si.point if order_type == mt5.ORDER_TYPE_BUY else price + 200 * si.point
+        tp = price + 400 * si.point if order_type == mt5.ORDER_TYPE_BUY else price - 400 * si.point
 
         request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": SYMBOL,
-            "volume": LOTS,
-            "type": order_type,
-            "price": price,
-            "sl": sl,
-            "tp": tp,
-            "deviation": 10,
-            "magic": self.magic_number,
-            "comment": "AI News Sentiment Trade",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": get_filling_mode(SYMBOL),
+            "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": LOTS,
+            "type": order_type, "price": price, "sl": sl, "tp": tp,
+            "deviation": 10, "magic": self.magic_number, "comment": "AI Multi-Asset",
+            "type_time": mt5.ORDER_TIME_GTC, "type_filling": self.get_filling_mode(symbol),
         }
 
-        # Αποστολή εντολής
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S") # Το τρέχον timestamp
+        
         result = mt5.order_send(request)
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            print(f"❌ Execution Failed: {result.comment} (Code: {result.retcode})")
+            print(f"[{now}] ❌ {symbol} Trade Failed: {result.comment}")
         else:
-            print(f"🚀 SUCCESS: {SYMBOL} {('BUY' if order_type==0 else 'SELL')} at {price}")
+            # Εδώ προσθέσαμε την τιμή και την ώρα
+            print(f"[{now}] 🚀 SUCCESS: {symbol} {'BUY' if order_type==0 else 'SELL'} at {price}")
+
+    def save_to_csv(self, symbol, avg_score, action, headline):
+        file_name = "forex_ai_trading_logs.csv"
+        tick = mt5.symbol_info_tick(symbol)
+        price = tick.bid if tick else 0
+        new_data = pd.DataFrame([{
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol, "price": price, "sentiment": round(avg_score, 4),
+            "action": action, "headline": headline.replace(',', '|') if headline else "N/A"
+        }])
+        new_data.to_csv(file_name, index=False, mode='a', header=not os.path.exists(file_name), encoding='utf-8')
+
+    def run_cycle(self):
+        if not self.is_market_open(): return
+        articles = self.fetch_global_news()
+        if not articles: return
+
+        for symbol in self.symbols:
+            keywords = SYMBOLS_CONFIG[symbol]
+            relevant = [a['title'] for a in articles if any(k.lower() in a['title'].lower() for k in keywords)]
+
+            if relevant:
+                avg_score = sum([self.analyzer.polarity_scores(h)['compound'] for h in relevant]) / len(relevant)
+                now = datetime.now().strftime("%H:%M:%S") # Timestamp μόνο ώρας για τα logs
+
+                # Decision Logic
+                action = "WAIT"
+                if avg_score > THRESHOLD: action = "BUY"
+                elif avg_score < -THRESHOLD: action = "SELL"
+
+                final_status = action
+                if action != "WAIT":
+                    if len(mt5.positions_get(symbol=symbol)) > 0:
+                        final_status = f"LOGGED_{action}_NO_TRADE"
+                    elif self.is_too_correlated(symbol):
+                        final_status = f"CORR_BLOCKED_{action}"
+                    else:
+                        ot = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+                        self.execute_trade(symbol, ot)
+
+                self.save_to_csv(symbol, avg_score, final_status, relevant[0])
+                print(f"[{now}] 📊 {symbol} | Sentiment: {avg_score:.2f} | Status: {final_status}")
 
     def run_forever(self):
-        """Autonomous Loop: Καταγραφή δεδομένων ΠΑΝΤΑ, Εκτέλεση trades υπό προϋποθέσεις"""
         while True:
-            current_time = datetime.now().strftime("%H:%M:%S")
-            
-            if not self.is_market_open():
-                print(f"[{current_time}] 💤 Market Closed. Hibernating...")
-            
-            else:
-                print(f"[{current_time}] 🟢 Scanning Market & News...")
-                headlines = self.fetch_live_news()
-                
-                if headlines:
-                    # 1. Υπολογισμός Sentiment
-                    scores = [self.analyzer.polarity_scores(h)['compound'] for h in headlines]
-                    avg_score = sum(scores) / len(scores)
-                    
-                    # 2. Καθορισμός Action (για το Log)
-                    potential_action = "WAIT"
-                    if avg_score > THRESHOLD:
-                        potential_action = "BUY"
-                    elif avg_score < -THRESHOLD:
-                        potential_action = "SELL"
-                    
-                    # 3. ΕΛΕΓΧΟΣ ΕΚΤΕΛΕΣΗΣ (Μόνο αν ΔΕΝ υπάρχει θέση)
-                    if self.check_existing_positions():
-                        print(f"📊 Sentiment: {avg_score:.4f} | Position Active: TRADE SKIPPED")
-                        final_action = f"LOGGED_{potential_action}_NO_TRADE"
-                    else:
-                        final_action = potential_action
-                        if potential_action == "BUY":
-                            self.execute_trade(mt5.ORDER_TYPE_BUY)
-                        elif potential_action == "SELL":
-                            self.execute_trade(mt5.ORDER_TYPE_SELL)
-                    
-                    # 4. ΑΠΟΘΗΚΕΥΣΗ ΣΤΟ CSV (Γίνεται ΠΑΝΤΑ)
-                    self.save_to_csv(avg_score, final_action, headlines)
-                    print(f"📝 Data saved to CSV with action: {final_action}")
-                    
-                else:
-                    print("⚠️ No news found in this cycle. Skipping log.")
-
-            print(f"⏳ Next cycle in {INTERVAL/60} minutes.\n")
+            self.run_cycle()
             time.sleep(INTERVAL)
-    
-    def get_historical_data(symbol, timeframe, count):
-        # Σύνδεση με την MT5
-        if not mt5.initialize():
-            print("Initialization failed")
-            return None
-
-        # Λήψη δεδομένων (π.χ. TIMEFRAME_H1 = 1 ώρα)
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
-        
-        # Μετατροπή σε Pandas DataFrame
-        df = pd.DataFrame(rates)
-        
-        # Μετατροπή του χρόνου σε αναγνώσιμη μορφή
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        
-        return df
-    
-    def save_to_csv(self, avg_score, action, headlines):
-        """Data Stage: Καταγραφή Sentiment + Τιμής για ML Training"""
-        file_name = "forex_ai_trading_logs.csv"
-        
-        # Λήψη τρέχουσας τιμής από την MT5
-        tick = mt5.symbol_info_tick(SYMBOL)
-        current_price = tick.bid if tick else 0
-        
-        new_data = {
-            "timestamp": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-            "symbol": [SYMBOL],
-            "current_price": [current_price], # Η τιμή τη στιγμή της ανάλυσης
-            "sentiment_score": [round(avg_score, 4)],
-            "action": [action],
-            "headline_sample": [headlines[0].replace(',', '|') if headlines else "N/A"]
-        }
-        
-        df = pd.DataFrame(new_data)
-
-        # Append στο CSV
-        if not os.path.isfile(file_name):
-            df.to_csv(file_name, index=False, mode='w', encoding='utf-8')
-        else:
-            df.to_csv(file_name, index=False, mode='a', header=False, encoding='utf-8')
 
 if __name__ == "__main__":
-    bot = WindowsForexMasterAI()
-    try:
-        bot.run_forever()
+    bot = MultiAssetForexAI()
+    try: bot.run_forever()
     except KeyboardInterrupt:
         mt5.shutdown()
-        print("\n--- [SYSTEM] Bot stopped by user ---")
+        print("\n--- [SYSTEM] Stopped ---")
