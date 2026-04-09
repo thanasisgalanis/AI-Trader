@@ -2,6 +2,7 @@ import MetaTrader5 as mt5
 import requests
 import time
 import os
+import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -105,34 +106,91 @@ class WindowsForexMasterAI:
             print(f"🚀 SUCCESS: {SYMBOL} {('BUY' if order_type==0 else 'SELL')} at {price}")
 
     def run_forever(self):
-        """Autonomous Loop"""
+        """Autonomous Loop: Καταγραφή δεδομένων ΠΑΝΤΑ, Εκτέλεση trades υπό προϋποθέσεις"""
         while True:
             current_time = datetime.now().strftime("%H:%M:%S")
             
             if not self.is_market_open():
                 print(f"[{current_time}] 💤 Market Closed. Hibernating...")
             
-            elif self.check_existing_positions():
-                print(f"[{current_time}] ⏳ Position already active. Monitoring...")
-            
             else:
-                print(f"[{current_time}] 🟢 Scanning Live News...")
+                print(f"[{current_time}] 🟢 Scanning Market & News...")
                 headlines = self.fetch_live_news()
+                
                 if headlines:
+                    # 1. Υπολογισμός Sentiment
                     scores = [self.analyzer.polarity_scores(h)['compound'] for h in headlines]
                     avg_score = sum(scores) / len(scores)
                     
-                    print(f"📊 Sentiment Score: {avg_score:.4f}")
-                    
+                    # 2. Καθορισμός Action (για το Log)
+                    potential_action = "WAIT"
                     if avg_score > THRESHOLD:
-                        self.execute_trade(mt5.ORDER_TYPE_BUY)
+                        potential_action = "BUY"
                     elif avg_score < -THRESHOLD:
-                        self.execute_trade(mt5.ORDER_TYPE_SELL)
+                        potential_action = "SELL"
+                    
+                    # 3. ΕΛΕΓΧΟΣ ΕΚΤΕΛΕΣΗΣ (Μόνο αν ΔΕΝ υπάρχει θέση)
+                    if self.check_existing_positions():
+                        print(f"📊 Sentiment: {avg_score:.4f} | Position Active: TRADE SKIPPED")
+                        final_action = f"LOGGED_{potential_action}_NO_TRADE"
                     else:
-                        print("😴 Neutral Sentiment. No action.")
+                        final_action = potential_action
+                        if potential_action == "BUY":
+                            self.execute_trade(mt5.ORDER_TYPE_BUY)
+                        elif potential_action == "SELL":
+                            self.execute_trade(mt5.ORDER_TYPE_SELL)
+                    
+                    # 4. ΑΠΟΘΗΚΕΥΣΗ ΣΤΟ CSV (Γίνεται ΠΑΝΤΑ)
+                    self.save_to_csv(avg_score, final_action, headlines)
+                    print(f"📝 Data saved to CSV with action: {final_action}")
+                    
+                else:
+                    print("⚠️ No news found in this cycle. Skipping log.")
 
             print(f"⏳ Next cycle in {INTERVAL/60} minutes.\n")
             time.sleep(INTERVAL)
+    
+    def get_historical_data(symbol, timeframe, count):
+        # Σύνδεση με την MT5
+        if not mt5.initialize():
+            print("Initialization failed")
+            return None
+
+        # Λήψη δεδομένων (π.χ. TIMEFRAME_H1 = 1 ώρα)
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+        
+        # Μετατροπή σε Pandas DataFrame
+        df = pd.DataFrame(rates)
+        
+        # Μετατροπή του χρόνου σε αναγνώσιμη μορφή
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        
+        return df
+    
+    def save_to_csv(self, avg_score, action, headlines):
+        """Data Stage: Καταγραφή Sentiment + Τιμής για ML Training"""
+        file_name = "forex_ai_trading_logs.csv"
+        
+        # Λήψη τρέχουσας τιμής από την MT5
+        tick = mt5.symbol_info_tick(SYMBOL)
+        current_price = tick.bid if tick else 0
+        
+        new_data = {
+            "timestamp": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            "symbol": [SYMBOL],
+            "current_price": [current_price], # Η τιμή τη στιγμή της ανάλυσης
+            "sentiment_score": [round(avg_score, 4)],
+            "action": [action],
+            "headline_sample": [headlines[0].replace(',', '|') if headlines else "N/A"]
+        }
+        
+        df = pd.DataFrame(new_data)
+
+        # Append στο CSV
+        if not os.path.isfile(file_name):
+            df.to_csv(file_name, index=False, mode='w', encoding='utf-8')
+        else:
+            df.to_csv(file_name, index=False, mode='a', header=False, encoding='utf-8')
 
 if __name__ == "__main__":
     bot = WindowsForexMasterAI()
