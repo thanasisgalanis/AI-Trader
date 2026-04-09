@@ -6,10 +6,17 @@ load_dotenv()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 SYMBOLS_CONFIG = {
+    # MAJOR FOREX
     "EURUSD": ["EUR", "ECB", "Eurozone", "Fed", "USD"],
     "GBPUSD": ["GBP", "Pound", "BoE", "London", "USD"],
-    "XAUUSD": ["Gold", "XAU", "Inflation", "Safe Haven"],
-    "USDJPY": ["JPY", "Yen", "BoJ", "Tokyo", "USD"]
+    "USDJPY": ["JPY", "Yen", "BoJ", "Tokyo", "USD"],
+    
+    # COMMODITY FOREX
+    "AUDUSD": ["AUD", "RBA", "China", "Iron Ore", "Australia"],
+    "USDCAD": ["CAD", "BoC", "Oil", "Crude", "WTI", "Canada"],
+    
+    # METALS
+    "XAUUSD": ["Gold", "XAU", "Inflation", "Safe Haven", "Gold Prices"],
 }
 
 LOTS = 0.1
