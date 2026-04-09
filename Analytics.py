@@ -4,7 +4,7 @@ import matplotlib.dates as mdates
 import os
 
 def generate_dashboard(symbol="EURUSD"):
-    file_name = "forex_ai_trading_logs.csv"
+    file_name = "logs/forex_ai_trading_logs.csv"
     if not os.path.exists(file_name):
         print(f"❌ Το αρχείο {file_name} δεν βρέθηκε.")
         return
