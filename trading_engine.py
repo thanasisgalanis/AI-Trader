@@ -5,6 +5,7 @@ import os
 import pandas as pd
 import numpy as np
 import threading
+import json
 from datetime import datetime
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from config import *
@@ -57,13 +58,34 @@ class MultiAssetForexAI:
         os._exit(0)
 
     def fetch_global_news(self):
-        query = "Forex OR Fed OR ECB OR Economy OR Inflation"
-        url = f'https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&apiKey={NEWS_API_KEY}'
+        """Ανάκτηση κορυφαίων οικονομικών ειδήσεων με Debugging"""
+        # Χρησιμοποιούμε top-headlines για μεγαλύτερη εγκυρότητα και λιγότερο "θόρυβο"
+        url = f'https://newsapi.org/v2/top-headlines?category=business&language=en&apiKey={NEWS_API_KEY}'
+        
         try:
             response = requests.get(url, timeout=10)
-            return response.json().get('articles', [])
+            data = response.json()
+            
+            # Έλεγχος αν το API επέστρεψε σφάλμα (π.χ. Rate Limited)
+            if data.get("status") == "error":
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ NewsAPI Error: {data.get('message')}")
+                return []
+            
+            articles = data.get('articles', [])
+            
+            # Ενημέρωση στην κονσόλα για το status της σύνδεσης
+            if articles:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 📡 NewsAPI Success: Received {len(articles)} articles.")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ NewsAPI Warning: Connected but found 0 articles.")
+                
+            return articles
+
+        except requests.exceptions.Timeout:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ NewsAPI Timeout: Server didn't respond.")
+            return []
         except Exception as e:
-            print(f"⚠️ News API Error: {e}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ NewsAPI Connection Error: {e}")
             return []
 
     def get_market_structure(self, symbol):
